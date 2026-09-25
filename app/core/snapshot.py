@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from .replay import (
-    CheckinRecord,
     Event,
     ReplayState,
     StudentProgress,
     explain_checkin,
     replay,
 )
+from .rules import RuleSpec
 
 
 @dataclass
@@ -25,6 +25,8 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    # 生成快照时培养方案下的规则版本目录，使历史快照能自解释规则来源。
+    rule_catalog: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +37,7 @@ class Snapshot:
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
             "students": self.students,
+            "rule_catalog": self.rule_catalog,
         }
 
     @classmethod
@@ -47,6 +50,7 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            rule_catalog=list(data.get("rule_catalog", [])),
         )
 
 
@@ -61,7 +65,11 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
         "pending_lesson_units": progress.pending_lesson_units,
         "meets_requirement": progress.meets_requirement,
         "daily": [
-            {"academic_day": d.academic_day, "seconds": d.seconds}
+            {
+                "academic_day": d.academic_day,
+                "seconds": d.seconds,
+                "seconds_by_rule": _stringify_rule_keys(d.by_rule),
+            }
             for d in progress.daily
         ],
         "checkins": [explain_checkin(c, tz_name) for c in progress.checkins],
@@ -70,10 +78,18 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
                 "event_id": a.event_id,
                 "seconds": a.seconds,
                 "reason": a.reason,
+                "rule_version_id": a.rule_version_id,
             }
             for a in progress.adjustments
         ],
+        "seconds_by_rule": _stringify_rule_keys(progress.seconds_by_rule),
+        "adjustments_by_rule": _stringify_rule_keys(progress.adjustments_by_rule),
     }
+
+
+def _stringify_rule_keys(mapping: dict[str | None, int]) -> dict[str, int]:
+    """JSON 键必须是字符串；None（基线口径）固定写为 null 之外的 '__baseline__'。"""
+    return {(k if k is not None else "__baseline__"): v for k, v in mapping.items()}
 
 
 def build_snapshot(
@@ -85,6 +101,9 @@ def build_snapshot(
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
     generated_at: datetime | None = None,
+    rule_specs: dict[str, RuleSpec] | None = None,
+    rule_catalog: list[dict[str, Any]] | None = None,
+    override: tuple[RuleSpec, datetime] | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
     state: ReplayState = replay(
@@ -93,6 +112,8 @@ def build_snapshot(
         timezone_name=timezone_name,
         required_seconds=required_seconds,
         up_to_event_id=event_cutoff_id,
+        rule_specs=rule_specs,
+        override=override,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -111,6 +132,7 @@ def build_snapshot(
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
         students=students,
+        rule_catalog=list(rule_catalog or []),
     )
 
 

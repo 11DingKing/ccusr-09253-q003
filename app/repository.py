@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -53,6 +53,7 @@ def _to_core_event(row: EventModel) -> CoreEvent:
         student_id=row.student_id,
         payload=dict(row.payload),
         created_at=row.created_at,
+        rule_version_id=row.rule_version_id,
     )
 
 
@@ -61,8 +62,16 @@ def insert_events(
     *,
     plan_version: str,
     events: list[dict[str, Any]],
+    bindings: dict[str, str | None] | None = None,
+    occurred_at: dict[str, datetime] | None = None,
 ) -> tuple[list[str], list[str]]:
-    """执行确定性的业务处理。"""
+    """执行确定性的业务处理。
+
+    ``bindings[eid]`` 为导入时解析并固化的规则版本 id；``occurred_at`` 为
+    解析用的业务发生时间。重复事件忽略整行，固化绑定绝不二次改写。
+    """
+    bindings = bindings or {}
+    occurred_at = occurred_at or {}
     accepted: list[str] = []
     duplicates: list[str] = []
     for e in events:
@@ -72,6 +81,8 @@ def insert_events(
             student_id=e["student_id"],
             event_type=e["event_type"],
             payload=e["payload"],
+            rule_version_id=bindings.get(e["event_id"]),
+            occurred_at=occurred_at.get(e["event_id"]),
         )
         stmt = stmt.on_conflict_do_nothing(
             index_elements=["event_id", "plan_version"]

@@ -8,3 +8,7 @@ __pycache__/
 htmlcov/
 .env
 .DS_Store
+
+# SQLite 数据文件
+*.db
+*.egg-info/

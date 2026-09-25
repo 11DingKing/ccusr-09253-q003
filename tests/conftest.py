@@ -9,12 +9,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db import get_db
 from app.main import app
 from app.models import Base
+from app.scheduler import scheduler
 
 test_engine = create_engine(
     "sqlite:///./practice_hours_test.db",
     connect_args={"check_same_thread": False, "timeout": 30},
 )
 TestSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False, future=True)
+
+# 定时生效轮询指向测试库，并拉长间隔，避免后台线程干扰用例；
+# 定时生效由用例显式调用 scheduler.run_once() 确定性触发。
+scheduler.configure(session_factory=TestSessionLocal, interval_seconds=3600)
 
 @pytest.fixture(autouse=True)
 def _schema() -> Iterator[None]:

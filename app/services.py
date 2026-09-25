@@ -7,15 +7,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from .core.snapshot import Snapshot, build_snapshot, diff_snapshots, explain_student
+from .core.snapshot import Snapshot, diff_snapshots, explain_student
+from . import rule_service
 from .repository import (
     get_freeze,
     get_plan,
     insert_events,
-    insert_freeze,
-    load_events,
-    load_events_up_to,
-    max_event_id,
     upsert_plan,
 )
 
@@ -74,25 +71,27 @@ def import_events(
     db: Session, *, plan_version: str, events: list[dict[str, Any]]
 ) -> dict[str, Any]:
     _require_plan(db, plan_version)
+    # 导入时按业务发生时间解析当时有效规则版本并固化；规则升级不影响本批事件。
+    bindings, occurred_at = rule_service.bind_events(
+        db, plan_version, events, datetime.now(timezone.utc)
+    )
     accepted, duplicates = insert_events(
-        db, plan_version=plan_version, events=events
+        db,
+        plan_version=plan_version,
+        events=events,
+        bindings=bindings,
+        occurred_at=occurred_at,
     )
     return {
         "accepted": len(accepted),
         "duplicates": duplicates,
         "rejected": [],
+        "bindings": {eid: bindings[eid] for eid in accepted},
     }
 
 
 def current_snapshot(db: Session, plan_version: str) -> Snapshot:
-    plan = _require_plan(db, plan_version)
-    events = load_events(db, plan_version)
-    return build_snapshot(
-        events,
-        plan_version=plan_version,
-        timezone_name=plan.iana_timezone,
-        required_seconds=plan.required_seconds,
-    )
+    return rule_service.current_rule_snapshot(db, plan_version)
 
 
 def student_progress(
@@ -106,33 +105,7 @@ def freeze_semester(
     db: Session, *, plan_version: str, freeze_id: str
 ) -> tuple[Snapshot, bool]:
     """执行确定性的业务处理。"""
-    plan = _require_plan(db, plan_version)
-    existing = get_freeze(db, plan_version, freeze_id)
-    if existing is not None:
-        return Snapshot.from_dict(existing.snapshot), False
-
-    cutoff = max_event_id(db, plan_version)
-    events = load_events(db, plan_version)
-    snap = build_snapshot(
-        events,
-        plan_version=plan_version,
-        timezone_name=plan.iana_timezone,
-        required_seconds=plan.required_seconds,
-        freeze_id=freeze_id,
-        event_cutoff_id=cutoff,
-    )
-    row = insert_freeze(
-        db,
-        plan_version=plan_version,
-        freeze_id=freeze_id,
-        snapshot=snap.to_dict(),
-        event_cutoff_id=cutoff,
-    )
-    if row is None:
-        existing = get_freeze(db, plan_version, freeze_id)
-        assert existing is not None
-        return Snapshot.from_dict(existing.snapshot), False
-    return snap, True
+    return rule_service.freeze_rule_snapshot(db, plan_version, freeze_id)
 
 
 def get_frozen_snapshot(
