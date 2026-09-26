@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from .replay import (
     CheckinRecord,
     Event,
     ReplayState,
     StudentProgress,
+    display_rule_id,
     explain_checkin,
     replay,
 )
+from .rules import BASELINE_RULE, BASELINE_RULE_ID, RuleSpec, spec_to_params
 
 
 @dataclass
@@ -25,6 +27,7 @@ class Snapshot:
     generated_at: str
     event_cutoff_id: str | None
     students: list[dict[str, Any]]
+    rules: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +37,7 @@ class Snapshot:
             "required_seconds": self.required_seconds,
             "generated_at": self.generated_at,
             "event_cutoff_id": self.event_cutoff_id,
+            "rules": self.rules,
             "students": self.students,
         }
 
@@ -47,6 +51,7 @@ class Snapshot:
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
             students=list(data.get("students", [])),
+            rules=dict(data.get("rules", {})),
         )
 
 
@@ -64,16 +69,62 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
             {"academic_day": d.academic_day, "seconds": d.seconds}
             for d in progress.daily
         ],
+        "rule_segments": [
+            {
+                "rule_id": display_rule_id(seg.rule_id),
+                "confirmed_seconds": seg.confirmed_seconds,
+                "pending_seconds": seg.pending_seconds,
+                "adjustment_seconds": seg.adjustment_seconds,
+                "total_seconds": seg.total_seconds,
+                "lesson_units": seg.lesson_units,
+                "pending_lesson_units": seg.pending_lesson_units,
+                "daily": [
+                    {"academic_day": d.academic_day, "seconds": d.seconds}
+                    for d in seg.daily
+                ],
+            }
+            for seg in progress.segments
+        ],
         "checkins": [explain_checkin(c, tz_name) for c in progress.checkins],
         "adjustments": [
             {
                 "event_id": a.event_id,
                 "seconds": a.seconds,
                 "reason": a.reason,
+                "rule_id": display_rule_id(a.rule_id),
             }
             for a in progress.adjustments
         ],
     }
+
+
+def _rules_provenance(
+    state: ReplayState,
+    rules: Mapping[str, RuleSpec],
+    rule_meta: Mapping[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """汇总快照实际引用到的规则版本及其来源信息。
+
+    历史快照借此解释每一条记录的规则来源，即使该版本之后被撤回，
+    其参数与生效区间仍保留在快照里。
+    """
+    used: set[str | None] = set()
+    for progress in state.students.values():
+        for segment in progress.segments:
+            used.add(segment.rule_id)
+
+    provenance: dict[str, Any] = {}
+    for rule_id in sorted(used, key=lambda rid: rid or ""):
+        spec = (rules.get(rule_id) or BASELINE_RULE) if rule_id else BASELINE_RULE
+        entry: dict[str, Any] = spec_to_params(spec)
+        if rule_id is None:
+            entry.update(
+                {"state": "baseline", "effective_from": None, "withdrawn_at": None}
+            )
+        else:
+            entry.update(rule_meta.get(rule_id, {"state": "unknown"}))
+        provenance[display_rule_id(rule_id)] = entry
+    return provenance
 
 
 def build_snapshot(
@@ -85,14 +136,18 @@ def build_snapshot(
     freeze_id: str | None = None,
     event_cutoff_id: str | None = None,
     generated_at: datetime | None = None,
+    rules: Mapping[str, RuleSpec] | None = None,
+    rule_meta: Mapping[str, dict[str, Any]] | None = None,
 ) -> Snapshot:
     """执行确定性的业务处理。"""
+    rule_specs = rules or {}
     state: ReplayState = replay(
         events,
         plan_version=plan_version,
         timezone_name=timezone_name,
         required_seconds=required_seconds,
         up_to_event_id=event_cutoff_id,
+        rules=rule_specs,
     )
     if generated_at is None:
         generated_at = datetime.now(timezone.utc)
@@ -111,6 +166,7 @@ def build_snapshot(
         generated_at=generated_at.isoformat().replace("+00:00", "Z"),
         event_cutoff_id=event_cutoff_id,
         students=students,
+        rules=_rules_provenance(state, rule_specs, rule_meta or {}),
     )
 
 
@@ -166,6 +222,7 @@ def diff_snapshots(old: Snapshot, new: Snapshot) -> dict[str, Any]:
             "lesson_units",
             "pending_lesson_units",
             "meets_requirement",
+            "rule_segments",
         )
         changed_fields = {}
         for field_name in fields:
